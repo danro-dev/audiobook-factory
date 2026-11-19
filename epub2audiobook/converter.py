@@ -93,25 +93,33 @@ class ConvertOptions:
 
 ProgressCb = Callable[[float, str], None]
 LogCb = Callable[[str], None]
-ChapterCb = Callable[[int, str], None]   # (chapter.index or 0 for credits, state) state: synth|encode|done|cached
+ChapterCb = Callable[[int, str], None]   # (chapter.index or 0 for credits, state) state: synth|encode|done|cached|paused
+DetailCb = Callable[[dict], None]
 
 
 class Converter:
     def __init__(self, book: Book, chapters: list[Chapter], options: ConvertOptions,
                  on_progress: Optional[ProgressCb] = None, on_log: Optional[LogCb] = None,
                  cancel_event: Optional[threading.Event] = None, engine: Optional[object] = None,
-                 on_chapter: Optional[ChapterCb] = None):
+                 on_chapter: Optional[ChapterCb] = None, pause_event: Optional[threading.Event] = None,
+                 on_detail: Optional[DetailCb] = None):
         self.book = book
         self.chapters = chapters
         self.opt = options
         self._progress = on_progress or (lambda f, m: None)
         self._log = on_log or (lambda m: log.info(m))
         self._chapter_cb = on_chapter or (lambda i, s: None)
+        self._detail_cb = on_detail or (lambda d: None)
         self._cancel = cancel_event or threading.Event()
+        self._pause = pause_event or threading.Event()
         self.engine = engine or make_engine(options.engine, options.device)
         self.total_chars = 0
         self.done_chars = 0
         self._t0 = 0.0
+        self._paused_total = 0.0
+        self._last_frac = 0.0
+        self._last_msg = ""
+        self._current_ch_idx = 0
         self._encode_lock = threading.Lock()
         self._encoded = 0
         self._encode_total = 0
@@ -121,14 +129,52 @@ class Converter:
         if self._cancel.is_set():
             raise CancelledError()
 
-    def _report(self, msg: str):
+    def _wait_if_paused(self, chapter_idx: Optional[int] = None) -> float:
+        """Block cleanly while `pause_event` is set; return seconds spent paused."""
+        self._check_cancel()
+        if not self._pause.is_set():
+            return 0.0
+        idx = self._current_ch_idx if chapter_idx is None else chapter_idx
+        t_start = time.time()
+        self._log("Conversion paused.")
+        if idx > 0:
+            self._chapter_cb(idx, "paused")
+        self._detail_cb({"state": "paused", "chapter_idx": idx, "frac": self._last_frac, "msg": "Paused"})
+        self._progress(self._last_frac, f"Paused — {self._last_msg}" if self._last_msg else "Paused")
+        while self._pause.is_set():
+            if self._cancel.is_set():
+                raise CancelledError()
+            time.sleep(0.1)
+        paused_dt = time.time() - t_start
+        self._paused_total += paused_dt
+        self._log(f"Conversion resumed (paused {fmt_hms(paused_dt)}).")
+        if idx > 0:
+            self._chapter_cb(idx, "synth")
+        self._detail_cb({"state": "running", "chapter_idx": idx, "frac": self._last_frac, "msg": self._last_msg})
+        self._progress(self._last_frac, self._last_msg or "Resuming…")
+        return paused_dt
+
+    def _report(self, msg: str, chapter_idx: int = 0, chunk_num: int = 0, chunk_total: int = 0):
         frac = (self.done_chars / self.total_chars) if self.total_chars else 0.0
-        elapsed = time.time() - self._t0
+        elapsed = max(0.0, time.time() - self._t0 - self._paused_total)
         eta = ""
+        eta_sec = 0.0
         if frac > 0.02 and elapsed > 5:
-            remaining = elapsed / frac - elapsed
-            eta = f"  (ETA {fmt_hms(remaining)})"
-        self._progress(frac * 0.90, msg + eta)
+            eta_sec = max(0.0, elapsed / frac - elapsed)
+            eta = f"  (ETA {fmt_hms(eta_sec)})"
+        scaled = frac * 0.90
+        self._last_frac = scaled
+        self._last_msg = msg + eta
+        self._progress(scaled, self._last_msg)
+        self._detail_cb({
+            "state": "running",
+            "chapter_idx": chapter_idx,
+            "chunk_num": chunk_num,
+            "chunk_total": chunk_total,
+            "frac": scaled,
+            "eta_sec": eta_sec,
+            "msg": self._last_msg,
+        })
 
     # ------------------------------------------------------------------
     def run(self) -> str:
@@ -173,7 +219,8 @@ class Converter:
             self._encode_total = len(jobs)
 
             for n, (idx, title, ch) in enumerate(jobs, 1):
-                self._check_cancel()
+                self._current_ch_idx = idx
+                self._wait_if_paused(idx)
                 key = self._cache_key(voice, ch)
                 base = work_dir / f"ch{idx:03d}_{key}"
                 m4a = base.with_suffix(".m4a")
@@ -185,10 +232,11 @@ class Converter:
                     with self._encode_lock:
                         self._encoded += 1
                     items.append((idx, title, m4a, _duration_of(m4a, wav)))
-                    self._report(f"Chapter {n}/{len(jobs)} cached")
+                    self._report(f"Chapter {n}/{len(jobs)} cached", chapter_idx=idx)
                     continue
 
                 t_ch = time.time()
+                paused_before = self._paused_total
                 self._chapter_cb(idx, "synth")
                 if ch is None:
                     self._log(f"[{n}/{len(jobs)}] Opening credits: " + " / ".join(
@@ -204,20 +252,30 @@ class Converter:
                     write_wav(tmp, audio)
                     tmp.replace(wav)
                 dur = audio.size / SAMPLE_RATE
-                spent = time.time() - t_ch
-                self._log(f"    {dur / 60:.1f} min of audio in {spent:.0f}s ({dur / max(spent, 0.01):.1f}x realtime)")
+                spent = max(0.01, (time.time() - t_ch) - (self._paused_total - paused_before))
+                rtx = dur / spent
+                self._log(f"    {dur / 60:.1f} min of audio in {spent:.0f}s ({rtx:.1f}x realtime)")
+                self._detail_cb({
+                    "state": "running",
+                    "chapter_idx": idx,
+                    "chapter_num": n,
+                    "chapter_total": len(jobs),
+                    "realtime_x": rtx,
+                    "frac": self._last_frac,
+                    "msg": self._last_msg,
+                })
                 items.append((idx, title, m4a, dur))
                 self._chapter_cb(idx, "encode")
                 futures.append(pool.submit(self._encode_job, idx, title, wav, m4a, dur))
 
-            self._check_cancel()
+            self._wait_if_paused(0)
             # wait for the background encoders
             pending = [f for f in futures if not f.done()]
             if pending:
                 self._log(f"Waiting for {len(pending)} chapter encode(s) to finish…")
             for f in futures:
                 while not f.done():
-                    self._check_cancel()
+                    self._wait_if_paused(0)
                     with self._encode_lock:
                         k = self._encoded
                     self._progress(0.90 + 0.05 * k / max(1, self._encode_total),
@@ -317,7 +375,7 @@ class Converter:
         if self.book.authors:
             lines.append(credits_author_line(self.book.authors, lang))
         for i, line in enumerate(lines):
-            self._check_cancel()
+            self._wait_if_paused(0)
             a = self._synth(line, voice)
             if a.size:
                 parts += [a, silence(1.0 if i < len(lines) - 1 else 1.8)]
@@ -330,14 +388,14 @@ class Converter:
         label = f"Chapter {n}/{total}: {ch.title[:40]}"
         first_is_heading = bool(blocks) and blocks[0].kind == "heading"
         if opt.read_titles and not first_is_heading and ch.title:
-            self._check_cancel()
+            self._wait_if_paused(ch.index)
             a = self._synth(normalize_text(ch.title, opt.lang, is_heading=True), voice)
             if a.size:
                 parts += [a, silence(opt.pause_heading)]
             self.done_chars += len(ch.title)
         chunk_count = 0
         for b in blocks:
-            self._check_cancel()
+            self._wait_if_paused(ch.index)
             if b.kind == "break":
                 parts.append(silence(opt.pause_break))
                 continue
@@ -350,19 +408,19 @@ class Converter:
                 if a.size:
                     parts += [a, silence(opt.pause_heading)]
                 self.done_chars += len(b.text)
-                self._report(label)
+                self._report(label, chapter_idx=ch.index, chunk_num=chunk_count)
                 continue
             chunks = chunk_paragraph(text, opt.lang, opt.max_chars)
             for ci, chunk in enumerate(chunks):
-                self._check_cancel()
+                self._wait_if_paused(ch.index)
                 a = self._synth(chunk, voice)
                 if a.size:
                     parts.append(a)
                     parts.append(silence(opt.pause_chunk if ci < len(chunks) - 1 else opt.pause_para))
                 chunk_count += 1
                 self.done_chars += len(chunk)
-                if chunk_count % 4 == 0:
-                    self._report(label)
+                if chunk_count % 2 == 0 or ci == len(chunks) - 1:
+                    self._report(label, chapter_idx=ch.index, chunk_num=chunk_count)
         parts.append(silence(opt.pause_chapter_end))
         return np.concatenate(parts) if parts else silence(1.0)
 

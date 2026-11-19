@@ -47,4 +47,4 @@ Repository = "https://github.com/danro-dev/audiobook-factory"
 Upstream = "https://github.com/vr-marco/epub2audiobook"
 
 [tool.setuptools]
-packages = ["epub2audiobook"]
+packages = ["epub2audiobook", "epub2audiobook.ui"]
