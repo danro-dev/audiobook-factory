@@ -10,6 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10,<3.13"
 authors = [{ name = "Marco Ghislanzoni" }]
+maintainers = [{ name = "danro-dev" }]
 keywords = ["epub", "audiobook", "m4b", "tts", "kokoro", "text-to-speech"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -24,9 +25,11 @@ dependencies = [
     "kokoro>=0.9.4",
     "misaki[en,ja,zh]>=0.9.4",
     "espeakng-loader",
+    "supertonic>=1.3",
     "wxPython>=4.2",
     "ebooklib",
     "beautifulsoup4",
+    "pdfminer.six",
     "lxml",
     "soundfile",
     "numpy",
@@ -39,7 +42,9 @@ dependencies = [
 epub2audiobook = "epub2audiobook.app:main"
 
 [project.urls]
-Homepage = "https://github.com/vr-marco/epub2audiobook"
+Homepage = "https://github.com/danro-dev/audiobook-factory"
+Repository = "https://github.com/danro-dev/audiobook-factory"
+Upstream = "https://github.com/vr-marco/epub2audiobook"
 
 [tool.setuptools]
 packages = ["epub2audiobook"]

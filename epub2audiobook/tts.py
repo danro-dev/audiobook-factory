@@ -8,10 +8,11 @@ from typing import Optional
 
 import numpy as np
 
-from .voices import LANGUAGES
+from .voices import LANGUAGES, supertonic_lang
 
 SAMPLE_RATE = 24000
 REPO_ID = "hexgrad/Kokoro-82M"
+SUPERTONIC_CACHE_HINT = "~/.cache/supertonic3"
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,20 @@ def device_description() -> str:
     return "CPU"
 
 
+def _resample(a: np.ndarray, src_rate: int, dst_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Resample mono float32 audio to the pipeline's 24 kHz (torchaudio if present, else linear)."""
+    if src_rate == dst_rate or a.size == 0:
+        return a
+    try:
+        import torch
+        import torchaudio.functional as AF  # ships with the torchaudio installed by setup.ps1
+        return AF.resample(torch.from_numpy(a), int(src_rate), int(dst_rate)).numpy().astype(np.float32)
+    except Exception:
+        n = max(1, int(round(a.size * dst_rate / src_rate)))
+        return np.interp(np.linspace(0, a.size - 1, n, dtype=np.float64),
+                         np.arange(a.size, dtype=np.float64), a).astype(np.float32)
+
+
 class KokoroEngine:
     """Thread-safe (serialised) text-to-speech using Kokoro-82M.
 
@@ -45,6 +60,8 @@ class KokoroEngine:
     in the standard HF cache directory. espeak-ng (needed for non-English languages and for
     out-of-dictionary English words) is provided by the `espeakng-loader` wheel.
     """
+
+    label = "Kokoro"
 
     def __init__(self, device: Optional[str] = "auto", repo_id: str = REPO_ID):
         self.device = resolve_device(device)
@@ -124,3 +141,69 @@ class KokoroEngine:
                 torch.cuda.empty_cache()
         except Exception:
             pass
+
+
+class SupertonicEngine:
+    """Thread-safe (serialised) text-to-speech using Supertonic 3 (ONNX Runtime, CPU).
+
+    The model (~400 MB) plus its ten built-in voice styles (F1-F5, M1-M5) are downloaded from
+    Hugging Face on first use and cached by the package (see SUPERTONIC_CACHE_HINT). Synthesis
+    runs on the CPU; audio arrives at the model's 44.1 kHz and is resampled to SAMPLE_RATE so the
+    rest of the pipeline (pauses, AAC encoding, M4B muxing) is unchanged.
+    """
+
+    label = "Supertonic 3"
+
+    def __init__(self, device: Optional[str] = "auto", model_name: str = "supertonic-3"):
+        self.device = "cpu"        # ONNX Runtime CPU inference; the Device choice only affects Kokoro
+        self.model_name = model_name
+        self._tts = None
+        self._styles: dict[str, object] = {}
+        self._lock = threading.RLock()
+
+    # ------------------------------------------------------------------
+    def _engine(self):
+        with self._lock:
+            if self._tts is None:
+                try:
+                    from supertonic import TTS  # heavy import (onnxruntime), deferred
+                except ImportError as e:  # pragma: no cover
+                    raise RuntimeError("Supertonic is not installed. Install it with: "
+                                       "uv pip install supertonic") from e
+                self._tts = TTS(model=self.model_name)
+            return self._tts
+
+    def _style(self, voice: str):
+        with self._lock:
+            if voice not in self._styles:
+                self._styles[voice] = self._engine().get_voice_style(voice)
+            return self._styles[voice]
+
+    def warm_up(self, lang: str, voice: str) -> None:
+        self._style(voice)
+
+    # ------------------------------------------------------------------
+    def synthesize(self, text: str, voice: str, lang: str, speed: float = 1.0) -> np.ndarray:
+        """Return float32 mono audio at 24 kHz for `text` (empty array if nothing was produced)."""
+        text = text.strip()
+        if not text:
+            return np.zeros(0, dtype=np.float32)
+        tts = self._engine()
+        style = self._style(voice)
+        with self._lock:
+            wav, _duration = tts.synthesize(text, voice_style=style, speed=speed,
+                                            lang=supertonic_lang(lang), verbose=False)
+        a = np.asarray(wav, dtype=np.float32).reshape(-1)
+        return _resample(a, int(getattr(tts, "sample_rate", SAMPLE_RATE)))
+
+    def release(self) -> None:
+        with self._lock:
+            self._tts = None
+            self._styles.clear()
+
+
+def make_engine(name: str = "kokoro", device: Optional[str] = "auto"):
+    """Build the engine named by the `engine` option: 'kokoro' or 'supertonic'."""
+    if (name or "").lower() == "supertonic":
+        return SupertonicEngine(device)
+    return KokoroEngine(device)

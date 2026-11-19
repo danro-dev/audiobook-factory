@@ -21,12 +21,13 @@ from typing import Callable, Optional
 import numpy as np
 
 from . import __version__
-from .audio import (SAMPLE_RATE, build_m4b, encode_chapter_aac, fade_edges, find_ffmpeg, fmt_hms, normalize_level,
-                    prepare_cover, silence, trim_silence, write_wav)
+from .audio import (AUDIO_FORMATS, SAMPLE_RATE, build_m4b, encode_chapter_aac, export_audio, export_chapter_files,
+                    fade_edges, find_ffmpeg, fmt_hms, format_extension, normalize_level, prepare_cover, silence,
+                    trim_silence, write_cue, write_wav)
 from .epub_parser import Book, Chapter
 from .textproc import chunk_paragraph, normalize_text
-from .tts import KokoroEngine
-from .voices import default_voice
+from .tts import make_engine
+from .voices import default_voice_for
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,9 @@ class ConvertOptions:
     output_path: str
     voice: str = "af_heart"
     lang: str = "a"
+    engine: str = "kokoro"      # 'kokoro' or 'supertonic'
+    format: str = "m4b"         # m4b | m4a | mp3 | opus | flac
+    chapter_files: bool = False  # write one file per chapter into a folder instead of one book file
     speed: float = 1.0
     device: str = "auto"
     bitrate: str = "64k"
@@ -80,7 +84,8 @@ class ConvertOptions:
 
     def cache_key(self) -> str:
         d = asdict(self)
-        for k in ("output_path", "device", "bitrate", "keep_work_files", "work_dir", "encode_workers"):
+        for k in ("output_path", "device", "bitrate", "keep_work_files", "work_dir", "encode_workers",
+                  "format", "chapter_files"):
             d.pop(k, None)
         d["v"] = __version__
         return repr(sorted(d.items()))
@@ -94,7 +99,7 @@ ChapterCb = Callable[[int, str], None]   # (chapter.index or 0 for credits, stat
 class Converter:
     def __init__(self, book: Book, chapters: list[Chapter], options: ConvertOptions,
                  on_progress: Optional[ProgressCb] = None, on_log: Optional[LogCb] = None,
-                 cancel_event: Optional[threading.Event] = None, engine: Optional[KokoroEngine] = None,
+                 cancel_event: Optional[threading.Event] = None, engine: Optional[object] = None,
                  on_chapter: Optional[ChapterCb] = None):
         self.book = book
         self.chapters = chapters
@@ -103,7 +108,7 @@ class Converter:
         self._log = on_log or (lambda m: log.info(m))
         self._chapter_cb = on_chapter or (lambda i, s: None)
         self._cancel = cancel_event or threading.Event()
-        self.engine = engine or KokoroEngine(options.device)
+        self.engine = engine or make_engine(options.engine, options.device)
         self.total_chars = 0
         self.done_chars = 0
         self._t0 = 0.0
@@ -133,22 +138,28 @@ class Converter:
         if not find_ffmpeg():
             raise RuntimeError("ffmpeg not found on PATH. Install it (winget install Gyan.FFmpeg) and restart.")
         out_path = Path(opt.output_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        work_dir = Path(opt.work_dir) if opt.work_dir else out_path.parent / (out_path.stem + "_work")
+        fmt = (opt.format or "m4b").lower()
+        if fmt not in AUDIO_FORMATS:
+            raise ValueError(f"Unknown output format: {fmt!r}")
+        # chapter-files mode writes a folder; otherwise one file with the format's extension
+        out_final = out_path.with_suffix("") if opt.chapter_files else out_path.with_suffix(format_extension(fmt))
+        out_final.parent.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(opt.work_dir) if opt.work_dir else Path(str(out_final) + "_work")
+        master = None if (opt.chapter_files or fmt != "m4b") else out_final
         work_dir.mkdir(parents=True, exist_ok=True)
         self._t0 = time.time()
 
         self.total_chars = sum(ch.chars + len(ch.title) for ch in self.chapters)
         self.done_chars = 0
-        voice = opt.voice or default_voice(opt.lang)
+        voice = opt.voice or default_voice_for(opt.engine, opt.lang)
         workers = opt.encode_workers or max(1, min(4, (os.cpu_count() or 2) // 2))
 
         self._log(f"Book: {self.book.title} — {self.book.author or 'unknown author'}")
         self._log(f"Language: {opt.lang}  Voice: {voice}  Speed: {opt.speed}  Chapters: {len(self.chapters)}  "
                   f"AAC {opt.bitrate} ({workers} encoder thread{'s' if workers > 1 else ''})")
-        self._progress(0.0, "Loading Kokoro model…")
+        self._progress(0.0, "Loading the TTS model…")
         self.engine.warm_up(opt.lang, voice)
-        self._log(f"Kokoro loaded on {self.engine.device.upper()}")
+        self._log(f"{getattr(self.engine, 'label', 'TTS')} loaded on {self.engine.device.upper()}")
 
         # (index, title, m4a_path, duration) in playback order; futures fill in durations
         items: list[tuple[int, str, Path, float]] = []
@@ -224,18 +235,36 @@ class Converter:
         pool.shutdown(wait=True)
 
         self._check_cancel()
-        self._progress(0.95, "Assembling M4B…")
+        if master is not None:
+            self._progress(0.95, "Assembling M4B…")
+        else:
+            self._progress(0.95, "Assembling the chaptered master…")
         cover = prepare_cover(self.book.cover_bytes, self.book.cover_ext, work_dir, find_ffmpeg()) if self.book.cover_bytes else None
-        build_m4b([(str(p), t, d) for _, t, p, d in items], out_path, title=self.book.title, author=self.book.author,
-                  year=self.book.year, cover_path=cover, bitrate=opt.bitrate, work_dir=work_dir,
-                  on_progress=lambda f, m: self._progress(0.95 + 0.05 * f, m), on_log=self._log)
+        master_path = Path(master) if master is not None else work_dir / "master.m4b"
+        build_m4b([(str(p), t, d) for _, t, p, d in items], master_path, title=self.book.title,
+                  author=self.book.author, year=self.book.year, cover_path=cover, bitrate=opt.bitrate,
+                  work_dir=work_dir, on_progress=lambda f, m: self._progress(0.95 + 0.04 * f, m), on_log=self._log)
+
+        result = str(master_path)
+        if opt.chapter_files:
+            self._progress(0.99, "Writing one file per chapter…")
+            result = export_chapter_files([(str(p), t, d) for _, t, p, d in items], out_final, fmt,
+                                          title=self.book.title, author=self.book.author, on_log=self._log)
+        elif fmt != "m4b":
+            self._progress(0.99, f"Converting to {AUDIO_FORMATS[fmt][0]}…")
+            result = export_audio(master_path, out_final, fmt, on_log=self._log)
+            if fmt == "flac":  # FLAC has no chapter marker support: keep a cue sheet beside it
+                cue = write_cue([(t, d) for _, t, _, d in items], out_final,
+                                title=self.book.title, author=self.book.author)
+                self._log(f"FLAC cannot store chapter markers; wrote a cue sheet: {Path(cue).name}")
+
         total = time.time() - self._t0
         total_audio = sum(d for _, _, _, d in items)
-        self._log(f"Done in {fmt_hms(total)}: {fmt_hms(total_audio)} of audio, {len(items)} chapters -> {out_path}")
+        self._log(f"Done in {fmt_hms(total)}: {fmt_hms(total_audio)} of audio, {len(items)} chapters -> {result}")
         if not opt.keep_work_files:
             shutil.rmtree(work_dir, ignore_errors=True)
         self._progress(1.0, "Finished")
-        return str(out_path)
+        return str(result)
 
     # ------------------------------------------------------------------
     def _cache_key(self, voice: str, ch: Chapter | None) -> str:
@@ -356,10 +385,10 @@ def _duration_of(m4a: Path, wav: Path) -> float:
         return 0.0
 
 
-def preview_audio(book_lang: str, voice: str, text: str, speed: float = 1.0, engine: Optional[KokoroEngine] = None,
+def preview_audio(book_lang: str, voice: str, text: str, speed: float = 1.0, engine: Optional[object] = None,
                   max_chars: int = 350) -> np.ndarray:
     """Synthesize a short sample (used by the GUI preview)."""
-    engine = engine or KokoroEngine("auto")
+    engine = engine or make_engine("kokoro", "auto")
     parts: list[np.ndarray] = []
     for chunk in chunk_paragraph(normalize_text(text, book_lang), book_lang, max_chars)[:3]:
         a = engine.synthesize(chunk, voice, book_lang, speed)

@@ -154,6 +154,129 @@ def encode_chapter_aac(wav_path: str | Path, out_path: str | Path, bitrate: str 
     return str(out_path)
 
 
+# --------------------------------------------------------------------------------------
+# Export formats: the M4B master is assembled first, then remuxed / transcoded
+# --------------------------------------------------------------------------------------
+
+# format -> (label, extension)
+AUDIO_FORMATS = {
+    "m4b": ("M4B audiobook", ".m4b"),
+    "m4a": ("M4A audio", ".m4a"),
+    "mp3": ("MP3", ".mp3"),
+    "opus": ("Opus", ".opus"),
+    "flac": ("FLAC (lossless)", ".flac"),
+}
+
+# ffmpeg codec arguments per format (m4b/m4a are a stream copy of the AAC master)
+_EXPORT_CODECS = {
+    "mp3": ["-c:a", "libmp3lame", "-b:a", "128k"],
+    "opus": ["-c:a", "libopus", "-b:a", "48k", "-vbr", "on"],
+    "flac": ["-c:a", "flac", "-compression_level", "5"],
+}
+
+
+def format_extension(fmt: str) -> str:
+    return AUDIO_FORMATS.get((fmt or "").lower(), AUDIO_FORMATS["m4b"])[1]
+
+
+def export_audio(master: str | Path, out_path: str | Path, fmt: str, *,
+                 on_log: Optional[Callable[[str], None]] = None) -> str:
+    """Write the assembled M4B `master` as another container, keeping chapters, tags and cover.
+
+    Chapter markers survive in every format ffmpeg can carry them: MP4 atoms (M4A), ID3v2 CHAP
+    frames (MP3) and Vorbis comments (FLAC/Opus). Players differ in how well they read them.
+    """
+    log = on_log or (lambda m: None)
+    master, out_path = Path(master), Path(out_path)
+    fmt = (fmt or "m4b").lower()
+    if fmt not in AUDIO_FORMATS:
+        raise ValueError(f"Unknown audio format: {fmt!r}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.resolve() == master.resolve():
+        return str(out_path)
+    # write next to the target first so a failure never leaves a truncated book behind
+    tmp = out_path.with_name(f"{out_path.stem}.part{out_path.suffix}")
+
+    if fmt in ("m4b", "m4a"):
+        if fmt == "m4b":
+            shutil.copyfile(master, tmp)
+        else:  # same audio, MP4 brand M4A instead of the audiobook brand
+            _run([_require_ffmpeg(), "-y", "-hide_banner", "-loglevel", "error", "-i", str(master),
+                  "-map", "0:a", "-map", "0:v?", "-map_metadata", "0", "-map_chapters", "0",
+                  "-c", "copy", "-f", "ipod", str(tmp)])
+        tmp.replace(out_path)
+        log(f"wrote {out_path.name} (stream copy)")
+        return str(out_path)
+
+    ffmpeg = _require_ffmpeg()
+    codec = _EXPORT_CODECS[fmt]
+    common = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-i", str(master),
+              "-map", "0:a", "-map_metadata", "0", "-map_chapters", "0", *codec]
+    with_cover = None
+    if fmt in ("mp3", "flac"):  # Ogg/Opus has no portable cover art
+        with_cover = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-i", str(master),
+                      "-map", "0:a", "-map", "0:v:0", "-map_metadata", "0", "-map_chapters", "0",
+                      "-c:v", "copy", "-disposition:v:0", "attached_pic", *codec]
+    if with_cover:
+        try:
+            _run(with_cover + [str(tmp)])
+            tmp.replace(out_path)
+            log(f"wrote {out_path.name} ({fmt}, with cover art)")
+            return str(out_path)
+        except Exception as e:
+            log(f"cover art could not be embedded in {fmt} ({str(e).splitlines()[0][:80]}), writing audio only")
+    _run(common + [str(tmp)])
+    tmp.replace(out_path)
+    log(f"wrote {out_path.name} ({fmt})")
+    return str(out_path)
+
+
+def export_chapter_files(chapters: list[tuple[str, str, float]], out_dir: str | Path, fmt: str, *,
+                         title: str = "", author: str = "", on_log: Optional[Callable[[str], None]] = None) -> str:
+    """Write one tagged file per chapter into `out_dir` (for players that ignore chapter markers)."""
+    log = on_log or (lambda m: None)
+    ffmpeg = _require_ffmpeg()
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fmt = (fmt or "m4b").lower()
+    ext = ".m4a" if fmt in ("m4b", "m4a") else format_extension(fmt)
+    codec = ["-c:a", "copy"] if fmt in ("m4b", "m4a") else _EXPORT_CODECS[fmt]
+    total = len(chapters)
+    for n, (path, ctitle, _dur) in enumerate(chapters, 1):
+        safe = re.sub(r'[<>:"/\\|?*]', "_", ctitle).strip().strip(".")[:80] or f"chapter{n:03d}"
+        dst = out_dir / f"{n:03d} - {safe}{ext}"
+        _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats", "-i", str(path), *codec,
+              "-map_metadata", "-1", "-metadata", f"title={ctitle}", "-metadata", f"album={title}",
+              "-metadata", f"artist={author or 'Unknown'}", "-metadata", f"album_artist={author}",
+              "-metadata", "genre=Audiobook", "-metadata", f"track={n}/{total}", str(dst)])
+        log(f"wrote {dst.name}")
+    return str(out_dir)
+
+
+def _fmt_cue_time(seconds: float) -> str:
+    m, sec = divmod(max(0.0, seconds), 60)
+    frames = int(round((sec - int(sec)) * 75))
+    if frames == 75:
+        frames = 0
+        sec += 1
+    return f"{int(m):02d}:{int(sec):02d}:{frames:02d}"
+
+
+def write_cue(chapters: list[tuple[str, float]], out_path: str | Path, *, title: str = "",
+              author: str = "") -> str:
+    """Write a CUE sheet with the chapter timings next to a FLAC file (FLAC has no chapter marks)."""
+    out_path = Path(out_path)
+    cue = out_path.with_suffix(".cue")
+    lines = [f'PERFORMER "{author}"', f'TITLE "{title}"', f'FILE "{out_path.name}" WAVE']
+    pos = 0.0
+    for n, (ctitle, dur) in enumerate(chapters, 1):
+        lines += [f"  TRACK {n:02d} AUDIO", f'    TITLE "{ctitle}"', f"    INDEX 01 {_fmt_cue_time(pos)}"]
+        pos += max(0.0, dur)
+    cue.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(cue)
+
+
 def build_m4b(chapters: list[tuple[str, str, float]], out_path: str | Path, *, title: str, author: str = "",
               year: Optional[str] = None, cover_path: Optional[str] = None, bitrate: str = "64k",
               work_dir: Optional[Path] = None, on_progress: Optional[Callable[[float, str], None]] = None,

@@ -5,9 +5,11 @@ torch
 kokoro>=0.9.4
 misaki[en,ja,zh]>=0.9.4
 espeakng-loader
+supertonic>=1.3
 wxPython>=4.2
 ebooklib
 beautifulsoup4
+pdfminer.six
 lxml
 soundfile
 numpy

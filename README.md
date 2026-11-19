@@ -1,4 +1,17 @@
-# epub2audiobook — EPUB → M4B audiobook with Kokoro TTS
+# Audiobook Factory (`epub2audiobook` fork)
+
+> **Fork adapted by [@danro-dev](https://github.com/danro-dev)** based on the original [vr-marco/epub2audiobook](https://github.com/vr-marco/epub2audiobook) by Marco Ghislanzoni.
+>
+> **What's added in this fork:**
+> - **Supertonic TTS engine** (`--engine supertonic`) alongside Kokoro-82M.
+> - **PDF → EPUB conversion** (`--pdf-to-epub`, powered by `pdfminer.six`) directly from the GUI and CLI.
+> - **Additional audio formats & per-chapter export** (`--format`, `--chapter-files`).
+> - **Model warmup, GUI improvements & custom app icon** (`epub2audiobook/assets/`).
+> - **Windows silent launcher & standalone installer** (`EPUB-Audiobook.vbs`, `installer/`).
+
+---
+
+## Overview — EPUB → Audiobook with Kokoro & Supertonic TTS
 
 Turn any EPUB e-book into a chaptered **M4B audiobook** (AAC, cover art, metadata) narrated by the
 free, high-quality [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) neural voices. Runs fully
@@ -52,8 +65,8 @@ misaki 0.9.4, wxPython 4.3.1, ffmpeg 8.0, RTX 3080 Laptop 16 GB. Exact package v
 
 ## Installation on Windows
 
-1. **Get the code.** Either `git clone https://github.com/vr-marco/epub2audiobook.git`
-   or download the ZIP from GitHub and extract it, e.g. to `C:\Users\<you>\epub2audiobook`.
+1. **Get the code.** Either `git clone https://github.com/danro-dev/audiobook-factory.git`
+   or download the ZIP from GitHub and extract it, e.g. to `C:\Users\<you>\audiobook-factory`.
 
 2. **Run the setup script.** Open *PowerShell* in that folder (right-click the folder → "Open in
    Terminal") and run:

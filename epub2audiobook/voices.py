@@ -103,6 +103,50 @@ VOICES = {
 }
 
 
+# ----------------------------------------------------------------------------------------------
+# Engines. Kokoro per-language voices (above); Supertonic 3 has one language-agnostic set (below).
+# ----------------------------------------------------------------------------------------------
+ENGINE_IDS = ["kokoro", "supertonic"]
+ENGINE_LABELS = {
+    "kokoro": "Kokoro (54 voices)",
+    "supertonic": "Supertonic 3 (31 languages)",
+}
+
+# Kokoro language code -> Supertonic 3 ISO code (Supertonic has no Mandarin yet -> 'na' fallback)
+KOKORO_TO_SUPERTONIC = {"a": "en", "b": "en", "e": "es", "f": "fr", "h": "hi",
+                        "i": "it", "p": "pt", "j": "ja", "z": "na"}
+
+# Supertonic 3 built-in styles, usable for every language it supports.
+SUPERTONIC_VOICES = [
+    ("F1", "F1 (female)"),
+    ("F2", "F2 (female)"),
+    ("F3", "F3 (female)"),
+    ("F4", "F4 (female)"),
+    ("F5", "F5 (female)"),
+    ("M1", "M1 (male)"),
+    ("M2", "M2 (male)"),
+    ("M3", "M3 (male)"),
+    ("M4", "M4 (male)"),
+    ("M5", "M5 (male)"),
+]
+
+
+def voices_for(engine: str, lang_code: str) -> list[tuple[str, str]]:
+    """(voice id, label) pairs for `engine` in Kokoro language code `lang_code`."""
+    if engine == "supertonic":
+        return SUPERTONIC_VOICES
+    return VOICES.get(lang_code, VOICES["a"])
+
+
+def default_voice_for(engine: str, lang_code: str) -> str:
+    return voices_for(engine, lang_code)[0][0]
+
+
+def supertonic_lang(lang_code: str) -> str:
+    """Kokoro language code -> Supertonic 3 language code ('na' = language-agnostic fallback)."""
+    return KOKORO_TO_SUPERTONIC.get(lang_code, "na")
+
+
 def default_voice(lang_code: str) -> str:
     return VOICES.get(lang_code, VOICES["a"])[0][0]
 

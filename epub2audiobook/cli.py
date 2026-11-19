@@ -6,9 +6,10 @@ import sys
 import threading
 from pathlib import Path
 
+from .audio import AUDIO_FORMATS, format_extension
 from .converter import CancelledError, ConvertOptions, Converter
 from .epub_parser import detect_language_from_text, load_book
-from .voices import LANGUAGES, VOICES, default_voice, iso_to_kokoro
+from .voices import ENGINE_IDS, LANGUAGES, SUPERTONIC_VOICES, VOICES, default_voice_for, iso_to_kokoro
 
 
 def parse_ranges(spec: str, n: int) -> list[int]:
@@ -29,7 +30,7 @@ def parse_ranges(spec: str, n: int) -> list[int]:
 
 def main(argv=None):
     p = argparse.ArgumentParser(prog="epub2audiobook", description="Convert an EPUB into a chaptered M4B audiobook with Kokoro TTS.")
-    p.add_argument("epub", help="input .epub file")
+    p.add_argument("epub", nargs="?", help="input .epub file (a .pdf with --pdf-to-epub)")
     p.add_argument("-o", "--output", help="output .m4b (default: next to the epub)")
     p.add_argument("-l", "--list", action="store_true", help="list detected sections and exit")
     p.add_argument("--dump-text", metavar="N", type=int, help="print the extracted narration text of section N and exit")
@@ -38,8 +39,12 @@ def main(argv=None):
     p.add_argument("--lang", choices=sorted(LANGUAGES), help="Kokoro language code (default: from EPUB metadata)")
     p.add_argument("-v", "--voice", help="Kokoro voice id (default: best voice for the language)")
     p.add_argument("-s", "--speed", type=float, default=1.0)
+    p.add_argument("--engine", default="kokoro", choices=ENGINE_IDS, help="TTS engine (default: kokoro)")
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--bitrate", default="64k")
+    p.add_argument("--format", default="m4b", choices=list(AUDIO_FORMATS), help="output audio format (default: m4b)")
+    p.add_argument("--chapter-files", action="store_true", help="one file per chapter into a folder")
+    p.add_argument("--pdf-to-epub", action="store_true", help="convert a PDF to EPUB and exit")
     p.add_argument("--no-titles", action="store_true", help="do not announce chapter titles")
     p.add_argument("--no-credits", action="store_true", help="skip the opening credits (title, subtitle, author)")
     p.add_argument("--keep", action="store_true", help="keep per-chapter WAV work files")
@@ -47,11 +52,29 @@ def main(argv=None):
     p.add_argument("--voices", action="store_true", help="list available voices and exit")
     args = p.parse_args(argv)
 
+    if args.pdf_to_epub:
+        if not args.epub:
+            p.error("--pdf-to-epub needs an input PDF")
+        from .pdf2epub import convert_pdf
+        target = args.output or str(Path(args.epub).with_suffix(".epub"))
+        try:
+            print("wrote", convert_pdf(args.epub, target, on_log=print))
+        except Exception as e:
+            print(f"PDF conversion failed: {e}", file=sys.stderr)
+            return 2
+        return 0
+
+    if not args.epub:
+        p.error("an input .epub file is required")
+
     if args.voices:
         for code, name in LANGUAGES.items():
             print(f"{code}  {name}")
             for vid, label in VOICES[code]:
                 print(f"     {vid:14s} {label}")
+        print("supertonic  Supertonic 3 (one voice set, every supported language)")
+        for vid, label in SUPERTONIC_VOICES:
+            print(f"     {vid:14s} {label}")
         return 0
 
     book = load_book(args.epub)
@@ -89,9 +112,13 @@ def main(argv=None):
         print("No chapters selected.", file=sys.stderr)
         return 2
 
-    voice = args.voice or default_voice(lang)
-    out = args.output or str(Path(args.epub).with_suffix(".m4b"))
-    opts = ConvertOptions(output_path=out, voice=voice, lang=lang, speed=args.speed, device=args.device,
+    voice = args.voice or default_voice_for(args.engine, lang)
+    out = args.output or str(Path(args.epub).with_suffix(format_extension(args.format)))
+    if args.chapter_files:
+        out = str(Path(out).with_suffix(""))
+    opts = ConvertOptions(output_path=out, voice=voice, lang=lang, engine=args.engine,
+                          format=args.format, chapter_files=args.chapter_files,
+                          speed=args.speed, device=args.device,
                           bitrate=args.bitrate, read_titles=not args.no_titles, read_credits=not args.no_credits,
                           keep_work_files=args.keep,
                           work_dir=args.work_dir)

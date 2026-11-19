@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import traceback
@@ -13,19 +14,79 @@ from typing import Optional
 import wx
 import wx.adv
 
+# pythonw.exe (used by run_gui.bat) has no console, so sys.stdout/sys.stderr are None.
+# loguru -- imported by kokoro -- rejects a None sink, so hand it a real stream.
+if sys.stdout is None or sys.stderr is None:
+    _null = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = sys.stdout or _null
+    sys.stderr = sys.stderr or _null
+
 from . import __version__
-from .audio import find_ffmpeg, open_in_explorer, write_wav
+from .audio import AUDIO_FORMATS, find_ffmpeg, format_extension, open_in_explorer, write_wav
 from .converter import CancelledError, ConvertOptions, Converter, preview_audio
 from .epub_parser import Book, Chapter, detect_language_from_text, load_book
+from .pdf2epub import ScannedPdfError
 from .player import PlayerFrame
-from .tts import KokoroEngine, device_description
-from .voices import LANGUAGES, VOICES, default_voice, iso_to_kokoro
+from .tts import device_description, make_engine
+from .voices import ENGINE_IDS, ENGINE_LABELS, LANGUAGES, default_voice_for, iso_to_kokoro, voices_for
 
-SETTINGS_FILE = Path.home() / ".epub2audiobook.json"
+# EPUB2AUDIOBOOK_HOME lets a portable build keep its settings next to the program instead of the
+# user profile; unset (normal install) it stays in the home directory as before.
+SETTINGS_FILE = Path(os.environ.get("EPUB2AUDIOBOOK_HOME") or Path.home()) / ".epub2audiobook.json"
 WORDS_PER_MIN = 155  # Kokoro at speed 1.0, roughly
 LEFT_COL_DIP = 300   # width of the left (book + narration) column in DIP
 
 STATUS_TEXT = {"synth": "synthesizing…", "encode": "encoding…", "done": "✓ done", "cached": "✓ cached"}
+
+
+def _error_log_path() -> Path:
+    return SETTINGS_FILE.with_name("epub2audiobook-errors.log")
+
+
+def _log_line(msg: str) -> None:
+    """Append one timestamped line to the log. Only the PDF/load/lifecycle steps use it."""
+    try:
+        import datetime
+        with open(_error_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
+
+
+def _record_error(where: str, exc: BaseException) -> None:
+    """Append a traceback to the error log next to the settings file.
+
+    Under pythonw there is no console, so an unhandled exception used to vanish silently and the
+    window looked as if it had simply closed. Everything unexpected lands here instead.
+    """
+    try:
+        import datetime
+        with open(_error_log_path(), "a", encoding="utf-8") as fh:
+            fh.write(f"\n=== {where} - {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+            fh.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass
+
+
+class App(wx.App):
+    """wx.App that survives an exception raised inside an event handler.
+
+    wxPython ends the main loop when a handler raises, which closes the app with no message at
+    all under pythonw. Returning True keeps the window alive and the traceback gets logged.
+    """
+
+    def OnExceptionInMainLoop(self) -> bool:  # noqa: N802 - wx naming
+        exc = sys.exc_info()[1]
+        if exc is None:
+            return True
+        _record_error("event handler", exc)
+        try:
+            wx.MessageBox(f"Something went wrong and the app kept running.\n\n"
+                          f"{type(exc).__name__}: {exc}\n\nDetails: {_error_log_path()}",
+                          "Unexpected error", wx.ICON_ERROR)
+        except Exception:
+            pass
+        return True
 
 
 def load_settings() -> dict:
@@ -81,11 +142,13 @@ class TextPreviewDialog(wx.Dialog):
 
 class MainFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title=f"EPUB → Audiobook (Kokoro TTS) v{__version__}")
+        super().__init__(None, title=f"EPUB → Audiobook v{__version__}")
         self.SetSize(self.FromDIP(wx.Size(1240, 860)))
         self.SetMinSize(self.FromDIP(wx.Size(1000, 700)))
         self.book: Optional[Book] = None
-        self.engine: Optional[KokoroEngine] = None
+        self._setting_picker = False
+        self.engine: Optional[object] = None
+        self._engine_key: Optional[tuple] = None
         self.worker: Optional[threading.Thread] = None
         self.cancel_event = threading.Event()
         self.settings = load_settings()
@@ -95,11 +158,43 @@ class MainFrame(wx.Frame):
         self._build_ui()
         self.CreateStatusBar()
         self.SetStatusText(f"Compute: {device_description()}   •   ffmpeg: {find_ffmpeg() or 'NOT FOUND'}")
+        self._apply_icons()
         self.Centre()
         self.Bind(wx.EVT_CLOSE, self.on_close)
         if not find_ffmpeg():
             wx.CallAfter(wx.MessageBox, "ffmpeg was not found on PATH.\nInstall it (e.g. `winget install Gyan.FFmpeg`) "
                          "and restart, otherwise the M4B cannot be produced.", "ffmpeg missing", wx.ICON_WARNING)
+
+    def _apply_icons(self) -> None:
+        """Give the frame every icon size.
+
+        Windows draws the taskbar button with the *big* icon, so loading the .ico without asking
+        for a size (wx then takes the first entry, the 16 px one) leaves a blurry, wrong-looking
+        button. Asking for each size keeps small/taskbar/Alt-Tab sharp.
+        """
+        assets = Path(__file__).resolve().parent / "assets"
+        png, ico = assets / "app.png", assets / "app.ico"
+        # Rescale the PNG ourselves: wxMSW's .ico loader cannot read the PNG-compressed entries
+        # that PIL writes for 48 px and up, so half the sizes would silently go missing.
+        if png.exists():
+            try:
+                src = wx.Image(str(png), wx.BITMAP_TYPE_PNG)
+            except Exception:
+                src = None
+            if src is not None and src.IsOk():
+                bundle = wx.IconBundle()
+                for size in (16, 20, 24, 32, 40, 48, 64, 96, 128, 256):
+                    icon = wx.Icon(wx.Bitmap(src.Scale(size, size, wx.IMAGE_QUALITY_HIGH)))
+                    if icon.IsOk():
+                        bundle.AddIcon(icon)
+                if bundle.GetIconCount():
+                    self.SetIcons(bundle)
+                    return
+        if ico.exists():
+            try:
+                self.SetIcon(wx.Icon(str(ico), wx.BITMAP_TYPE_ICO))
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -110,13 +205,17 @@ class MainFrame(wx.Frame):
         # --- file rows
         grid = wx.FlexGridSizer(2, 2, d(6), d(8))
         grid.AddGrowableCol(1, 1)
-        grid.Add(wx.StaticText(panel, label="EPUB file:"), 0, wx.ALIGN_CENTER_VERTICAL)
-        self.epub_picker = wx.FilePickerCtrl(panel, message="Choose an EPUB", wildcard="EPUB files (*.epub)|*.epub|All files|*.*",
+        grid.Add(wx.StaticText(panel, label="File:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.epub_picker = wx.FilePickerCtrl(panel, message="Choose an EPUB or a PDF",
+                                             wildcard="Books (*.epub;*.pdf)|*.epub;*.pdf|EPUB (*.epub)|*.epub|"
+                                                      "PDF (*.pdf)|*.pdf|All files|*.*",
                                              style=wx.FLP_OPEN | wx.FLP_FILE_MUST_EXIST | wx.FLP_USE_TEXTCTRL)
         self.epub_picker.SetInitialDirectory(self.settings.get("last_epub_dir", str(Path.home())))
         grid.Add(self.epub_picker, 1, wx.EXPAND)
-        grid.Add(wx.StaticText(panel, label="Output M4B:"), 0, wx.ALIGN_CENTER_VERTICAL)
-        self.out_picker = wx.FilePickerCtrl(panel, message="Save audiobook as", wildcard="M4B audiobook (*.m4b)|*.m4b",
+        grid.Add(wx.StaticText(panel, label="Output file:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.out_picker = wx.FilePickerCtrl(panel, message="Save audiobook as",
+                                            wildcard="Audio book (*.m4b;*.m4a;*.mp3;*.opus;*.flac)|"
+                                                     "*.m4b;*.m4a;*.mp3;*.opus;*.flac|All files|*.*",
                                             style=wx.FLP_SAVE | wx.FLP_OVERWRITE_PROMPT | wx.FLP_USE_TEXTCTRL)
         grid.Add(self.out_picker, 1, wx.EXPAND)
         root.Add(grid, 0, wx.EXPAND | wx.ALL, d(10))
@@ -147,6 +246,11 @@ class MainFrame(wx.Frame):
         sb = set_sz.GetStaticBox()
         g = wx.FlexGridSizer(0, 2, d(6), d(6))
         g.AddGrowableCol(1, 1)
+        g.Add(wx.StaticText(sb, label="Engine:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.engine_choice = wx.Choice(sb, choices=[ENGINE_LABELS[e] for e in ENGINE_IDS])
+        saved_engine = self.settings.get("engine", "kokoro")
+        self.engine_choice.SetSelection(ENGINE_IDS.index(saved_engine) if saved_engine in ENGINE_IDS else 0)
+        g.Add(self.engine_choice, 1, wx.EXPAND)
         g.Add(wx.StaticText(sb, label="Language:"), 0, wx.ALIGN_CENTER_VERTICAL)
         self.lang_choice = wx.Choice(sb, choices=list(LANGUAGES.values()))
         self._lang_codes = list(LANGUAGES.keys())
@@ -166,7 +270,15 @@ class MainFrame(wx.Frame):
         self.bitrate_choice = wx.Choice(sb, choices=["48k", "64k", "96k", "128k"])
         self.bitrate_choice.SetStringSelection(self.settings.get("bitrate", "64k"))
         g.Add(self.bitrate_choice, 1, wx.EXPAND)
-        for c in (self.lang_choice, self.voice_choice, self.device_choice, self.bitrate_choice):
+        g.Add(wx.StaticText(sb, label="Format:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self._format_ids = list(AUDIO_FORMATS)
+        self.format_choice = wx.Choice(sb, choices=[f"{AUDIO_FORMATS[f][0]} ({AUDIO_FORMATS[f][1]})"
+                                                   for f in self._format_ids])
+        saved_fmt = self.settings.get("format", "m4b")
+        self.format_choice.SetSelection(self._format_ids.index(saved_fmt) if saved_fmt in self._format_ids else 0)
+        g.Add(self.format_choice, 1, wx.EXPAND)
+        for c in (self.engine_choice, self.lang_choice, self.voice_choice, self.device_choice, self.bitrate_choice,
+                  self.format_choice):
             c.SetMinSize(d(wx.Size(120, -1)))   # sizer uses this instead of the (wide) best size; EXPAND fills the column
         set_sz.Add(g, 0, wx.EXPAND | wx.ALL, d(4))
         self.chk_credits = wx.CheckBox(sb, label="Read opening credits (title, subtitle, author)")
@@ -175,7 +287,9 @@ class MainFrame(wx.Frame):
         self.chk_titles.SetValue(self.settings.get("read_titles", True))
         self.chk_keep = wx.CheckBox(sb, label="Keep per-chapter work files (resume)")
         self.chk_keep.SetValue(self.settings.get("keep_work_files", False))
-        for c in (self.chk_credits, self.chk_titles, self.chk_keep):
+        self.chk_split = wx.CheckBox(sb, label="One file per chapter (folder)")
+        self.chk_split.SetValue(self.settings.get("chapter_files", False))
+        for c in (self.chk_credits, self.chk_titles, self.chk_keep, self.chk_split):
             set_sz.Add(c, 0, wx.LEFT | wx.RIGHT | wx.TOP, d(4))
         prow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_preview = wx.Button(sb, label="▶ Preview voice")
@@ -218,7 +332,7 @@ class MainFrame(wx.Frame):
         prow2 = wx.BoxSizer(wx.HORIZONTAL)
         self.gauge = wx.Gauge(panel, range=1000)
         prow2.Add(self.gauge, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, d(8))
-        self.btn_convert = wx.Button(panel, label="Convert to M4B")
+        self.btn_convert = wx.Button(panel, label="Convert")
         self.btn_convert.SetFont(self.btn_convert.GetFont().Bold())
         self.btn_cancel = wx.Button(panel, label="Cancel")
         self.btn_cancel.Disable()
@@ -234,6 +348,7 @@ class MainFrame(wx.Frame):
 
         # events
         self.lang_choice.Bind(wx.EVT_CHOICE, self.on_lang_changed)
+        self.engine_choice.Bind(wx.EVT_CHOICE, self.on_engine_changed)
         self.btn_all.Bind(wx.EVT_BUTTON, lambda e: self._set_all(True))
         self.btn_none.Bind(wx.EVT_BUTTON, lambda e: self._set_all(False))
         self.btn_smart.Bind(wx.EVT_BUTTON, lambda e: self._smart_select())
@@ -247,9 +362,12 @@ class MainFrame(wx.Frame):
         self.btn_convert.Bind(wx.EVT_BUTTON, self.on_convert)
         self.btn_cancel.Bind(wx.EVT_BUTTON, lambda e: self.cancel_event.set())
         self.speed.Bind(wx.EVT_SPINCTRLDOUBLE, lambda e: self._update_selection_label())
+        self.format_choice.Bind(wx.EVT_CHOICE, self.on_format_changed)
+        self.chk_split.Bind(wx.EVT_CHECKBOX, lambda e: self._update_convert_label())
         self.left.Bind(wx.EVT_SIZE, self._on_left_size)
 
         self._set_lang(self.settings.get("lang", "a"), voice=self.settings.get("voice"))
+        self._update_convert_label()
 
     # ------------------------------------------------------------------ helpers
     def _log(self, msg: str):
@@ -286,8 +404,9 @@ class MainFrame(wx.Frame):
 
     def _fill_voices(self, code: str, voice: Optional[str] = None):
         self.voice_choice.Clear()
-        self._voice_ids = [v for v, _ in VOICES[code]]
-        for v, label in VOICES[code]:
+        entries = voices_for(self.current_engine(), code)
+        self._voice_ids = [v for v, _ in entries]
+        for v, label in entries:
             self.voice_choice.Append(f"{label}  [{v}]")
         sel = self._voice_ids.index(voice) if voice in self._voice_ids else 0
         self.voice_choice.SetSelection(sel)
@@ -295,22 +414,54 @@ class MainFrame(wx.Frame):
     def current_lang(self) -> str:
         return self._lang_codes[max(0, self.lang_choice.GetSelection())]
 
+    def current_engine(self) -> str:
+        i = self.engine_choice.GetSelection()
+        return ENGINE_IDS[i] if 0 <= i < len(ENGINE_IDS) else "kokoro"
+
     def current_voice(self) -> str:
         i = self.voice_choice.GetSelection()
-        return self._voice_ids[i] if 0 <= i < len(self._voice_ids) else default_voice(self.current_lang())
+        if 0 <= i < len(self._voice_ids):
+            return self._voice_ids[i]
+        return default_voice_for(self.current_engine(), self.current_lang())
 
     def current_device(self) -> str:
         return ["auto", "cuda", "cpu"][max(0, self.device_choice.GetSelection())]
 
+    def current_format(self) -> str:
+        i = self.format_choice.GetSelection()
+        return self._format_ids[i] if 0 <= i < len(self._format_ids) else "m4b"
+
+    def on_format_changed(self, _):
+        fmt = self.current_format()
+        self.settings["format"] = fmt
+        save_settings(self.settings)
+        path = self.out_picker.GetPath()
+        if path:
+            self.out_picker.SetPath(str(Path(path).with_suffix(format_extension(fmt))))
+        self._update_convert_label()
+
+    def _update_convert_label(self):
+        """The convert button names the format it will actually produce."""
+        ext = format_extension(self.current_format()).lstrip(".").upper()
+        self.btn_convert.SetLabel(f"Export chapters ({ext})" if self.chk_split.GetValue()
+                                  else f"Convert to {ext}")
+
     def on_lang_changed(self, _):
         self._fill_voices(self.current_lang(), self.settings.get(f"voice_{self.current_lang()}"))
 
-    def _get_engine(self) -> KokoroEngine:
-        dev = self.current_device()
-        if self.engine is None or (dev != "auto" and self.engine.device != dev):
+    def on_engine_changed(self, _):
+        self.settings["engine"] = self.current_engine()
+        save_settings(self.settings)
+        self._fill_voices(self.current_lang(), self.settings.get(f"voice_{self.current_lang()}"))
+
+    def _get_engine(self) -> object:
+        name = self.current_engine()
+        dev = self.current_device() if name == "kokoro" else "cpu"
+        if self.engine is None or self._engine_key != (name, dev):
             if self.engine is not None:
-                self.engine.release()
-            self.engine = KokoroEngine(dev)
+                self.engine.release()   # type: ignore[attr-defined]
+            self.engine = make_engine(name, dev)
+            self._engine_key = (name, dev)
         return self.engine
 
     def _selected_chapters(self) -> list[Chapter]:
@@ -348,17 +499,27 @@ class MainFrame(wx.Frame):
 
     def _busy(self, busy: bool):
         for w in (self.epub_picker, self.out_picker, self.btn_convert, self.btn_preview, self.btn_all, self.btn_none,
-                  self.btn_smart, self.lang_choice, self.voice_choice, self.speed, self.device_choice, self.bitrate_choice,
+                  self.btn_smart, self.engine_choice, self.lang_choice, self.voice_choice, self.speed,
+                  self.device_choice, self.bitrate_choice, self.format_choice, self.chk_split,
                   self.chk_titles, self.chk_credits, self.chk_keep):
             w.Enable(not busy)
         self.btn_cancel.Enable(busy)
 
     # ------------------------------------------------------------------ load
     def on_epub_chosen(self, _):
+        """One entry point for both book types: EPUB is loaded, PDF is converted first."""
+        if getattr(self, "_setting_picker", False):
+            return
         path = self.epub_picker.GetPath()
         if not path or not os.path.exists(path):
             return
         self.settings["last_epub_dir"] = str(Path(path).parent)
+        if Path(path).suffix.lower() == ".pdf":
+            self._start_pdf_import(path)
+        else:
+            self._start_epub_load(path)
+
+    def _start_epub_load(self, path: str):
         self.lbl_status.SetLabel("Parsing EPUB…")
         self._busy(True)
         self.btn_cancel.Disable()
@@ -373,6 +534,48 @@ class MainFrame(wx.Frame):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _start_pdf_import(self, pdf: str):
+        """A chosen PDF is converted to EPUB on the fly and then loaded like any other book."""
+        self.lbl_status.SetLabel("Converting PDF to EPUB…")
+        self._busy(True)
+        self.btn_cancel.Disable()
+        self._log(f"PDF → EPUB: {pdf}")
+        _log_line(f"pdf import start: {pdf}")
+
+        def work():
+            try:
+                from .pdf2epub import convert_pdf
+                out = convert_pdf(pdf, on_log=lambda m: wx.CallAfter(self._log, m))
+                wx.CallAfter(self._pdf_imported, out, None)
+            except Exception as e:
+                wx.CallAfter(self._pdf_imported, "", e)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pdf_imported(self, out: str, err: Optional[Exception]):
+        _log_line(f"pdf import done: out={out!r} err={err!r}")
+        if err is not None:
+            self._busy(False)
+            self.lbl_status.SetLabel("This PDF cannot be converted.")
+            if isinstance(err, ScannedPdfError):
+                msg = ("This PDF has no text layer — it looks scanned (pages stored as images).\n\n"
+                       "It has to be OCR'd first (e.g. with OCRmyPDF or Acrobat) before it can become "
+                       "an audiobook. EPUB files are unaffected.")
+            else:
+                msg = f"The PDF could not be converted:\n{type(err).__name__}: {err}"
+            self._log("PDF → EPUB failed: " + str(err))
+            wx.MessageBox(msg, "PDF → EPUB", wx.ICON_WARNING)
+            return
+        self._log(f"EPUB created from the PDF: {out}")
+        # SetPath may or may not fire EVT_FILEPICKER_CHANGED depending on the platform, so the
+        # load is started here exactly once and the event is ignored while we set the path.
+        self._setting_picker = True
+        try:
+            self.epub_picker.SetPath(out)
+        finally:
+            self._setting_picker = False
+        self._start_epub_load(out)
+
     def _load_failed(self, e: Exception):
         self._busy(False)
         self.lbl_status.SetLabel("Failed to load EPUB.")
@@ -380,6 +583,7 @@ class MainFrame(wx.Frame):
         wx.MessageBox(f"Could not read this EPUB:\n{e}", "Error", wx.ICON_ERROR)
 
     def _book_loaded(self, book: Book, iso_guess: Optional[str]):
+        _log_line(f"book loaded: {book.title!r} chapters={len(book.chapters)}")
         self.book = book
         self._busy(False)
         self._set_wrapped(self.lbl_title, book.title + (f": {book.subtitle}" if book.subtitle else ""))
@@ -528,14 +732,18 @@ class MainFrame(wx.Frame):
         if not out:
             wx.MessageBox("Choose an output file.", "Convert", wx.ICON_INFORMATION)
             return
-        if not out.lower().endswith(".m4b"):
-            out += ".m4b"
+        fmt = self.current_format()
+        split = self.chk_split.GetValue()
+        out = str(Path(out).with_suffix("")) if split else str(Path(out).with_suffix(format_extension(fmt)))
         lang = self.current_lang()
-        opts = ConvertOptions(output_path=out, voice=self.current_voice(), lang=lang, speed=float(self.speed.GetValue()),
-                              device=self.current_device(), bitrate=self.bitrate_choice.GetStringSelection() or "64k",
+        opts = ConvertOptions(output_path=out, voice=self.current_voice(), lang=lang, engine=self.current_engine(),
+                              format=fmt, chapter_files=split,
+                              speed=float(self.speed.GetValue()), device=self.current_device(),
+                              bitrate=self.bitrate_choice.GetStringSelection() or "64k",
                               read_titles=self.chk_titles.GetValue(), read_credits=self.chk_credits.GetValue(),
                               keep_work_files=self.chk_keep.GetValue())
-        self.settings.update({"lang": lang, "voice": opts.voice, f"voice_{lang}": opts.voice, "speed": opts.speed,
+        self.settings.update({"lang": lang, "voice": opts.voice, f"voice_{lang}": opts.voice, "engine": opts.engine,
+                              "format": opts.format, "chapter_files": opts.chapter_files, "speed": opts.speed,
                               "device": opts.device, "bitrate": opts.bitrate, "read_titles": opts.read_titles,
                               "read_credits": opts.read_credits, "keep_work_files": opts.keep_work_files,
                               "last_out_dir": str(Path(out).parent)})
@@ -602,6 +810,7 @@ class MainFrame(wx.Frame):
         wx.MessageBox(f"Conversion failed:\n{e}", "Error", wx.ICON_ERROR)
 
     def on_close(self, evt):
+        _log_line("closing")
         if self.worker and self.worker.is_alive():
             if wx.MessageBox("A conversion is running. Cancel it and quit?", "Quit", wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
                 return
@@ -617,13 +826,35 @@ class MainFrame(wx.Frame):
 
 
 def main(epub_path: Optional[str] = None):
-    app = wx.App(False)
+    def _excepthook(tp, value, tb):
+        if value is not None:
+            _record_error("unhandled", value)
+        sys.__excepthook__(tp, value, tb)
+
+    def _thread_hook(args):
+        if args.exc_value is not None:
+            name = args.thread.name if args.thread is not None else "?"
+            _record_error(f"thread {name}", args.exc_value)
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_hook
+    _log_line(f"app start (argv={sys.argv[1:]}, error log: {_error_log_path()})")
+    if os.name == "nt":
+        # Without an explicit AppUserModelID Windows groups the window under pythonw.exe and the
+        # taskbar button shows Python's icon instead of ours, even though the frame has its own.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Epub2Audiobook.Desktop")
+        except Exception:
+            pass
+    app = App(False)
     frame = MainFrame()
     frame.Show()
     if epub_path and os.path.exists(epub_path):
         frame.epub_picker.SetPath(os.path.abspath(epub_path))
         wx.CallAfter(frame.on_epub_chosen, None)
     app.MainLoop()
+    _log_line("main loop returned")
 
 
 if __name__ == "__main__":

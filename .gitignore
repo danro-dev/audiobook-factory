@@ -10,3 +10,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.freebuff/
+.tools/
+bin/
+installer/payload/
